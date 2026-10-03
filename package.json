@@ -1,0 +1,127 @@
+{
+    "name": "codebuddy-token-stats",
+    "displayName": "AI Token 用量大盘 (CodeBuddy & Antigravity)",
+    "description": "在 VSCode 内直接查看 CodeBuddy / 反重力(Antigravity) 的全维度 Token 消耗、模型配额与积分看板，无需命令行。",
+    "version": "1.0.8",
+    "publisher": "local",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "keywords": [
+        "token",
+        "codebuddy",
+        "antigravity",
+        "quota",
+        "credits"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./src/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "tokenStats.openDashboard",
+                "title": "打开 Token 用量大盘",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.refresh",
+                "title": "刷新 Token 数据",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.syncCredits",
+                "title": "同步 CodeBuddy 积分",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.pointsTasks",
+                "title": "一键领取积分任务 (签到 + 成长中心)",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.dailyCheckin",
+                "title": "立即执行 CodeBuddy 每日签到",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.showCredits",
+                "title": "查看积分余量",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.openInBrowser",
+                "title": "在浏览器中打开报表",
+                "category": "TokenStats"
+            },
+            {
+                "command": "tokenStats.showLastTurn",
+                "title": "查看最新回答 Token 统计",
+                "category": "TokenStats"
+            }
+        ],
+        "configuration": {
+            "title": "AI Token 用量大盘",
+            "properties": {
+                "tokenStats.dataSource": {
+                    "type": "string",
+                    "default": "all",
+                    "enum": [
+                        "all",
+                        "codebuddy",
+                        "antigravity"
+                    ],
+                    "enumDescriptions": [
+                        "CodeBuddy + 反重力 全部来源",
+                        "仅 CodeBuddy",
+                        "仅反重力 (Antigravity)"
+                    ],
+                    "description": "看板默认展示的数据来源"
+                },
+                "tokenStats.autoSyncCreditsOnOpen": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "打开看板时自动同步一次 CodeBuddy 官方积分（可能触发一次浏览器/插件登录态读取，稍慢）"
+                },
+                "tokenStats.showStatusBar": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "在状态栏右下角显示反重力 Token 监控按钮，点击可直接打开看板"
+                },
+                "tokenStats.showTurnStats": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "在状态栏右下角按钮中显示反重力 AI 回答的总 Token 量、上下文占比与 Token 速度"
+                },
+                "tokenStats.autoDailyCheckin": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "CodeBuddy 每日自动签到：扩展激活后延迟执行一次，之后每小时检查一次；当天已签到会自动跳过，不会重复领取，也不会触碰成长中心的补登卡等稀缺资源"
+                },
+                "tokenStats.turnPollIntervalMs": {
+                    "type": "number",
+                    "default": 3000,
+                    "description": "Antigravity DB 文件轮询间隔（毫秒），用于检测新的 AI 回答，默认 3000ms"
+                },
+                "tokenStats.codebuddyAccessToken": {
+                    "type": "string",
+                    "default": "",
+                    "description": "CodeBuddy AccessToken（可选）。在 Linux 或远程无桌面开发环境中无法自动解密凭据时可在此填入"
+                },
+                "tokenStats.codebuddyUid": {
+                    "type": "string",
+                    "default": "",
+                    "description": "CodeBuddy 用户 UID（可选，留空时将自动尝试从 Token 中解析）"
+                }
+            }
+        }
+    },
+    "scripts": {
+        "package": "vsce package --no-dependencies"
+    }
+}

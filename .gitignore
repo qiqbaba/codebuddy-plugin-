@@ -1,0 +1,42 @@
+# ── Node.js ───────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── VSCode 扩展产物 ──────────────────
+*.vsix
+.vscode-test/
+*.code-workspace
+
+# ── 报表产物 ─────────────────────────
+token-report.html
+
+# ── 运行时缓存（CLI 模式默认落在当前工作目录）──
+.antigravity-token-cache.json
+.codebuddy-credits-cache.json
+.codebuddy-points-tasks-cache.json
+
+# ── 模型上下文上限覆盖表（本地自定义）──
+model-limits.json
+
+# ── 本地记忆 / 数据 ──────────────────
+.codebuddy/memory/
+data/
+
+# ── 操作系统杂项 ─────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 编辑器 / IDE ─────────────────────
+.idea/
+*.swp
+*.swo
+*~
+
+# ── 日志 & 临时文件 ───────────────────
+*.log
+*.tmp
+*.bak

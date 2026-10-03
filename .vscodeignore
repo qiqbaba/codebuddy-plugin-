@@ -1,0 +1,14 @@
+.vscode/**
+.git/**
+.gitignore
+node_modules/**
+token-report.html
+.codebuddy-credits-cache.json
+.codebuddy-points-tasks-cache.json
+.codebuddy-auto-checkin-cache.json
+.antigravity-token-cache.json
+*.vsix
+test/**
+scripts/**
+eslint.config.js
+data/**
