@@ -5,7 +5,7 @@
 // 纯函数：仅依赖入参 data，不涉及任何数据采集/网络/文件写入逻辑，便于独立维护与测试。
 // ==========================================
 function buildReportHtml(data) {
-    const { conversations, fetchedAt = new Date().toISOString(), antigravityQuota, codebuddyCredits, sourceStats, filterSource, pointsTasksLast } = data;
+    const { conversations, fetchedAt = new Date().toISOString(), antigravityQuota, codebuddyCredits, sourceStats, filterSource, pointsTasksLast, dshPricing } = data;
 
     const clientData = conversations.map(c => ({
         id: c.id,
@@ -27,7 +27,8 @@ function buildReportHtml(data) {
         codebuddyCredits,
         pointsTasksLast,
         sourceStats,
-        filterSource
+        filterSource,
+        dshPricing: dshPricing || { currency: 'CNY', exchangeRate: 7.2 }
     })
         .replace(/</g, '\\u003c')
         .replace(/>/g, '\\u003e');
@@ -710,6 +711,38 @@ function buildReportHtml(data) {
             <div id="cbPackagesDetail" class="credits-packages-detail"></div>
         </div>
 
+        <!-- DSH (DeepSeek Harness) 用量与费用估算 -->
+        <div id="dshCostSection" class="quota-banner" style="display:none;">
+            <div style="flex: 1 1 320px;">
+                <div class="quota-title">
+                    <span>DSH (DeepSeek Harness) 用量与费用估算</span>
+                    <span id="dshCostBadge" class="badge" style="color:var(--accent-cyan); border-color:var(--accent-cyan);">-</span>
+                </div>
+                <div class="quota-sub" id="dshCostSubText">按 DeepSeek 官方峰谷两档价目表估算：缓存写入与缓存读取同价，推理 token 免费</div>
+                <div class="quota-progress-wrap">
+                    <div id="dshCacheProgressBar" class="quota-progress-bar" style="width: 0%;"></div>
+                </div>
+            </div>
+            <div class="quota-details">
+                <div class="quota-metric">
+                    <span class="quota-metric-label">会话 / 调用次数</span>
+                    <span class="quota-metric-value" id="dshMetricSessions">-</span>
+                </div>
+                <div class="quota-metric">
+                    <span class="quota-metric-label">总 Token</span>
+                    <span class="quota-metric-value" id="dshMetricTokens">-</span>
+                </div>
+                <div class="quota-metric">
+                    <span class="quota-metric-label">缓存命中率</span>
+                    <span class="quota-metric-value" id="dshMetricCacheRate">-</span>
+                </div>
+                <div class="quota-metric">
+                    <span class="quota-metric-label">峰值 / 谷值费用</span>
+                    <span class="quota-metric-value" id="dshMetricPeak" style="font-size:12px;">-</span>
+                </div>
+            </div>
+        </div>
+
         <!-- 综合筛选控制器：数据来源 + 时间范围 -->
         <div class="filter-panel">
             <div class="filter-row">
@@ -718,6 +751,7 @@ function buildReportHtml(data) {
                     <button class="btn-filter btn-source active" data-source="all" id="btnSourceAll">全部来源</button>
                     <button class="btn-filter btn-source" data-source="Antigravity" id="btnSourceAg">反重力 (Antigravity)</button>
                     <button class="btn-filter btn-source" data-source="CodeBuddy" id="btnSourceCb">CodeBuddy</button>
+                    <button class="btn-filter btn-source" data-source="DSH" id="btnSourceDsh">DSH (DeepSeek Harness)</button>
                 </div>
             </div>
 
@@ -951,22 +985,91 @@ function buildReportHtml(data) {
         // 渲染反重力模型配额与限制卡片
         let selectedQuotaModelKey = null;
 
+        function dshStats() {
+            return (META_DATA.sourceStats && META_DATA.sourceStats.dsh) || null;
+        }
+
         function updateQuotaVisibility() {
             const agSec = document.getElementById('quotaSection');
             const cbSec = document.getElementById('codebuddyCreditsSection');
+            const dshSec = document.getElementById('dshCostSection');
             const quota = META_DATA.antigravityQuota;
             const credits = META_DATA.codebuddyCredits;
             const src = (currentSource || '').toLowerCase();
 
             if (agSec) {
                 const hasAg = quota && (quota.remainingFraction !== null || (quota.models && Object.keys(quota.models).length > 0));
-                agSec.style.display = (hasAg && src !== 'codebuddy') ? 'flex' : 'none';
+                agSec.style.display = (hasAg && src !== 'codebuddy' && src !== 'dsh') ? 'flex' : 'none';
             }
 
             if (cbSec) {
                 const hasCb = credits && typeof credits.totalCredits === 'number';
-                cbSec.style.display = (hasCb && src !== 'antigravity') ? 'flex' : 'none';
+                cbSec.style.display = (hasCb && src !== 'antigravity' && src !== 'dsh') ? 'flex' : 'none';
             }
+
+            if (dshSec) {
+                const st = dshStats();
+                const hasDsh = !!(st && st.convCount > 0);
+                dshSec.style.display = (hasDsh && src !== 'antigravity' && src !== 'codebuddy') ? 'flex' : 'none';
+            }
+        }
+
+        // 渲染 DSH (DeepSeek Harness) 用量与费用估算卡片
+        function renderDshCost() {
+            const sec = document.getElementById('dshCostSection');
+            if (!sec) return;
+            const st = dshStats();
+            if (!st || !st.convCount) {
+                sec.style.display = 'none';
+                return;
+            }
+
+            const pricing = META_DATA.dshPricing || { currency: 'CNY', exchangeRate: 7.2 };
+            const isCny = pricing.currency === 'CNY';
+            const rate = Number(pricing.exchangeRate) > 0 ? Number(pricing.exchangeRate) : 7.2;
+            const money = usd => (isCny ? '¥' : '$') + (Number(usd || 0) * (isCny ? rate : 1)).toFixed(2);
+
+            const badgeEl = document.getElementById('dshCostBadge');
+            const subEl = document.getElementById('dshCostSubText');
+            const barEl = document.getElementById('dshCacheProgressBar');
+            const sessEl = document.getElementById('dshMetricSessions');
+            const tokensEl = document.getElementById('dshMetricTokens');
+            const rateEl = document.getElementById('dshMetricCacheRate');
+            const peakEl = document.getElementById('dshMetricPeak');
+
+            if (badgeEl) badgeEl.textContent = '估算 ' + money(st.costUsd || 0);
+            if (sessEl) sessEl.textContent = formatNumber(st.convCount) + ' / ' + formatNumber(st.turnsCount);
+            if (tokensEl) tokensEl.textContent = formatNumber(st.totalTokens);
+
+            const promptTokens = (st.cacheMissTokens || 0) + (st.cachedInputTokens || 0) + (st.cacheWriteTokens || 0);
+            const hitRate = promptTokens > 0 ? ((st.cachedInputTokens || 0) / promptTokens) * 100 : 0;
+            if (rateEl) rateEl.textContent = hitRate.toFixed(1) + '%';
+            if (barEl) barEl.style.width = hitRate.toFixed(1) + '%';
+            if (peakEl) {
+                peakEl.textContent = money(st.peakCostUsd || 0) + ' / ' + money(st.offPeakCostUsd || 0);
+            }
+            if (subEl) {
+                subEl.textContent = '按 DeepSeek 官方峰谷两档价目表估算：缓存写入与缓存读取同价，推理 token 免费' +
+                    (isCny ? ('（按 1 USD = ' + rate + ' CNY 折算）') : '');
+            }
+
+            updateQuotaVisibility();
+        }
+
+        // 来源切换按钮上的会话数量统计（三个来源 + 全部）
+        function updateSourceStatsButtons(sourceStats) {
+            if (!sourceStats) return;
+            const ag = sourceStats.antigravity || { convCount: 0 };
+            const cb = sourceStats.codebuddy || { convCount: 0 };
+            const dsh = sourceStats.dsh || { convCount: 0 };
+            const btnAll = document.getElementById('btnSourceAll');
+            const btnAg = document.getElementById('btnSourceAg');
+            const btnCb = document.getElementById('btnSourceCb');
+            const btnDsh = document.getElementById('btnSourceDsh');
+            if (btnAll) btnAll.textContent = '全部来源 (' + (ag.convCount + cb.convCount + dsh.convCount) + ')';
+            if (btnAg) btnAg.textContent = '反重力 (' + ag.convCount + ')';
+            if (btnCb) btnCb.textContent = 'CodeBuddy (' + cb.convCount + ')';
+            if (btnDsh) btnDsh.textContent = 'DSH (' + dsh.convCount + ')';
         }
 
         function renderModelQuotaDetails(m) {
@@ -1366,17 +1469,19 @@ function buildReportHtml(data) {
             updateFetchTimeDisplay(DATA_FETCHED_AT);
             renderQuotaBanner(META_DATA.antigravityQuota);
             renderCodeBuddyCredits(META_DATA.codebuddyCredits);
+            renderDshCost();
+            updateSourceStatsButtons(META_DATA.sourceStats);
 
-            // 更新来源切换按钮上的数量统计
-            if (META_DATA.sourceStats) {
-                const ag = META_DATA.sourceStats.antigravity;
-                const cb = META_DATA.sourceStats.codebuddy;
-                const btnAll = document.getElementById('btnSourceAll');
-                const btnAg = document.getElementById('btnSourceAg');
-                const btnCb = document.getElementById('btnSourceCb');
-                if (btnAll) btnAll.textContent = '全部来源 (' + (ag.convCount + cb.convCount) + ')';
-                if (btnAg) btnAg.textContent = '反重力 (' + ag.convCount + ')';
-                if (btnCb) btnCb.textContent = 'CodeBuddy (' + cb.convCount + ')';
+            // 报表以固定来源生成时（如配置 dataSource=dsh），默认选中对应来源按钮
+            const initialSource = String(META_DATA.filterSource || 'all').toLowerCase();
+            if (initialSource !== 'all') {
+                const initBtn = Array.from(document.querySelectorAll('.btn-source'))
+                    .find(b => String(b.dataset.source || '').toLowerCase() === initialSource);
+                if (initBtn) {
+                    document.querySelectorAll('.btn-source').forEach(b => b.classList.remove('active'));
+                    initBtn.classList.add('active');
+                    currentSource = initBtn.dataset.source;
+                }
             }
 
             // 来源切换按钮绑定
@@ -1478,15 +1583,12 @@ function buildReportHtml(data) {
                             }
                             if (resData.sourceStats) {
                                 META_DATA.sourceStats = resData.sourceStats;
-                                const ag = resData.sourceStats.antigravity;
-                                const cb = resData.sourceStats.codebuddy;
-                                const bAll = document.getElementById('btnSourceAll');
-                                const bAg = document.getElementById('btnSourceAg');
-                                const bCb = document.getElementById('btnSourceCb');
-                                if (bAll) bAll.textContent = '全部来源 (' + (ag.convCount + cb.convCount) + ')';
-                                if (bAg) bAg.textContent = '反重力 (' + ag.convCount + ')';
-                                if (bCb) bCb.textContent = 'CodeBuddy (' + cb.convCount + ')';
+                                updateSourceStatsButtons(resData.sourceStats);
                             }
+                            if (resData.dshPricing) {
+                                META_DATA.dshPricing = resData.dshPricing;
+                            }
+                            renderDshCost();
                             RAW_CONVERSATIONS = resData.conversations;
                             if (currentRange === 'all') {
                                 const extremes = getDataTimeExtremes();
@@ -1739,7 +1841,12 @@ function buildReportHtml(data) {
                 rangeDesc = '截止至 ' + formatDateTime(new Date(filterEnd).toISOString());
             }
             
-            let srcDesc = currentSource === 'all' ? '全部来源' : (currentSource === 'Antigravity' ? '反重力' : 'CodeBuddy');
+            let srcDesc = '全部来源';
+            if (currentSource !== 'all') {
+                if ((currentSource || '').toLowerCase() === 'antigravity') srcDesc = '反重力';
+                else if ((currentSource || '').toLowerCase() === 'dsh') srcDesc = 'DSH (DeepSeek Harness)';
+                else srcDesc = 'CodeBuddy';
+            }
             document.getElementById('filterSummaryText').textContent = '来源：' + srcDesc + ' | 时间范围：' + rangeDesc;
             document.getElementById('filterStatsText').textContent = '共命中 ' + totalTurns + ' 轮模型调用，' + convAggregates.length + ' 个活跃会话';
 

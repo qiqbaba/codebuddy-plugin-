@@ -74,12 +74,14 @@
                     "enum": [
                         "all",
                         "codebuddy",
-                        "antigravity"
+                        "antigravity",
+                        "dsh"
                     ],
                     "enumDescriptions": [
-                        "CodeBuddy + 反重力 全部来源",
+                        "CodeBuddy + 反重力 + DSH 全部来源",
                         "仅 CodeBuddy",
-                        "仅反重力 (Antigravity)"
+                        "仅反重力 (Antigravity)",
+                        "仅 DSH (DeepSeek Harness)"
                     ],
                     "description": "看板默认展示的数据来源"
                 },

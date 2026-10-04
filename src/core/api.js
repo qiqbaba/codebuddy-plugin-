@@ -14,7 +14,7 @@
 //   buildRefreshPayload(opts)         -> 刷新响应体
 //   syncCreditsBestEffort(ms)         -> { live, credits, error }
 //   runAllPointsTasks()               -> 积分任务结果
-//   getDataSource()                   -> 'all' | 'codebuddy' | 'antigravity'
+//   getDataSource()                   -> 'all' | 'codebuddy' | 'antigravity' | 'dsh'
 //   可选：onCredits(credits)、log(msg)、buildId、startedAt、writeReportOnRefresh
 // ==========================================
 
@@ -66,6 +66,7 @@ async function handleApiRequest(ctx, apiPath) {
                     antigravityQuota: d.antigravityQuota,
                     codebuddyCredits: d.codebuddyCredits,
                     sourceStats: d.sourceStats,
+                    dshPricing: d.dshPricing,
                     conversations: toConversations(d.conversations)
                 }
             };

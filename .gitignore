@@ -15,6 +15,7 @@ token-report.html
 
 # ── 运行时缓存（CLI 模式默认落在当前工作目录）──
 .antigravity-token-cache.json
+.dsh-token-cache.json
 .codebuddy-credits-cache.json
 .codebuddy-points-tasks-cache.json
 

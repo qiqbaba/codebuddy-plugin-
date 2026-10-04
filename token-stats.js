@@ -48,6 +48,21 @@ const log = require('./src/core/log');
 const { parseGenMetadataRow } = require('./src/core/antigravity-parse');
 // CodeBuddy assistant 消息解析入口（唯一）
 const { parseCodeBuddyAssistantMessage } = require('./src/core/codebuddy-parse');
+// DSH (DeepSeek Harness) 会话日志解析入口（唯一）
+const {
+    DSH_SOURCE,
+    resolveDshHome,
+    listSessionLogFiles,
+    readSessionRecords,
+    zstdSupported,
+    isPeakHour,
+    resolvePriceTier,
+    costOfBuckets,
+    usdFromCost,
+    getPricingConfig,
+    extractSession,
+    readProjcache
+} = require('./src/core/dsh-parse');
 
 // ==========================================
 // 模型名称规范化与别名归一化 (防止 API ID 与 Display Name 分裂)
@@ -272,6 +287,7 @@ function getModelMaxTokens(modelName) {
 let DATA_DIR = process.cwd();
 let REPORT_OUTPUT_PATH = path.join(DATA_DIR, 'token-report.html');
 let ANTIGRAVITY_CACHE_FILE = path.join(DATA_DIR, '.antigravity-token-cache.json');
+let DSH_CACHE_FILE = path.join(DATA_DIR, '.dsh-token-cache.json');
 let CODEBUDDY_CREDITS_CACHE_FILE = path.join(DATA_DIR, '.codebuddy-credits-cache.json');
 
 function setDataDir(dir) {
@@ -282,6 +298,7 @@ function setDataDir(dir) {
     POINTS_TASKS_CACHE_FILE = path.join(dir, '.codebuddy-points-tasks-cache.json');
     AUTO_CHECKIN_CACHE_FILE = path.join(dir, '.codebuddy-auto-checkin-cache.json');
     ANTIGRAVITY_CACHE_FILE = path.join(dir, '.antigravity-token-cache.json');
+    DSH_CACHE_FILE = path.join(dir, '.dsh-token-cache.json');
     REPORT_OUTPUT_PATH = path.join(dir, 'token-report.html');
     // 可选：模型上下文上限用户覆盖表（<dataDir>/model-limits.json）
     loadModelLimitOverrides(path.join(dir, 'model-limits.json'));
@@ -1979,11 +1996,245 @@ function collectCodeBuddyTokenData() {
 }
 
 // ==========================================
-// 4. 多源统一聚合管理器 (CodeBuddy & Antigravity)
+// 3.1 DSH (DeepSeek Harness) 数据采集与会话解析
+// ==========================================
+// 增量缓存的数据口径版本：解析/计价逻辑变化时必须递增，否则旧缓存中的错误数值会一直沿用。
+const DSH_CACHE_VERSION = 2;
+
+const EMPTY_MODEL_STAT = () => ({
+    turns: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    cacheMissTokens: 0,
+    cacheWriteTokens: 0,
+    thinkingTokens: 0,
+    lastOutputTokens: 0,
+    totalTokens: 0,
+    credit: 0,
+    elapsedMs: 0,
+    costUsd: 0
+});
+
+/** 会话目录名（--D-programme-xxx--）→ 可读路径，仅在日志缺少 cwd 时兜底。 */
+function decodeDshProjectDir(projectDir) {
+    return String(projectDir || '').replace(/^-+/, '').replace(/-+$/, '');
+}
+
+/**
+ * 解析单个 DSH 会话：逐次调用明细 → 与 CodeBuddy / Antigravity 同构的会话对象。
+ * 计价沿用 dsh-cost-meter 口径（DeepSeek 峰谷两档、缓存写入按命中价、推理免费）。
+ */
+function analyzeDshSession(home, entry) {
+    const pricing = getPricingConfig();
+    const proj = readProjcache(home, entry.sessionId) || {};
+
+    const header = {};
+    let calls = [];
+    let title = '';
+
+    const records = readSessionRecords(entry.filePath);
+    if (records) {
+        const parsed = extractSession(records);
+        if (parsed) {
+            Object.assign(header, parsed.header || {});
+            calls = parsed.calls || [];
+            title = parsed.title || '';
+        }
+    } else {
+        // 运行环境不支持 zstd：退回投影缓存，只提供会话级总量（无法拆分模型与时段）
+        const t = proj.totals;
+        if (!t) return null;
+        calls = [{
+            kind: 'assistant',
+            provider: '',
+            model: '',
+            atMs: Number(proj.identity && proj.identity.createdAt) || Date.now(),
+            turn: null,
+            step: null,
+            buckets: {
+                input: Number(t.uncachedInputTokens) || 0,
+                output: Number(t.outputTokens) || 0,
+                cacheRead: Number(t.cacheReadTokens) || 0,
+                cacheWrite: Number(t.cacheWriteTokens) || 0,
+                reasoning: 0
+            }
+        }];
+    }
+
+    if (calls.length === 0) return null;
+
+    calls.sort((a, b) => a.atMs - b.atMs);
+
+    const modelStats = {};
+    const turns = [];
+    const total = EMPTY_MODEL_STAT();
+    const providers = new Set();
+    let peakCostUsd = 0;
+    let offPeakCostUsd = 0;
+    let selectedModelId = '';
+
+    for (const call of calls) {
+        const b = call.buckets;
+        // Prompt 总量 = 未命中输入 + 缓存读 + 缓存写（三者在 DSH 中互斥）
+        const inputTokens = b.input + b.cacheRead + b.cacheWrite;
+        const outputTokens = b.output;
+        if (inputTokens === 0 && outputTokens === 0) continue;
+
+        const modelName = normalizeModelName(call.model);
+        const tier = resolvePriceTier(call.provider, call.model, call.atMs, pricing.currency);
+        const costUsd = usdFromCost(costOfBuckets(b, tier), tier.currency, pricing.exchangeRate);
+        if (tier.peak) peakCostUsd += costUsd; else offPeakCostUsd += costUsd;
+        if (call.provider) providers.add(call.provider);
+        selectedModelId = modelName;
+
+        if (!modelStats[modelName]) modelStats[modelName] = EMPTY_MODEL_STAT();
+        const m = modelStats[modelName];
+        m.turns += 1;
+        m.inputTokens += inputTokens;
+        m.outputTokens += outputTokens;
+        m.cachedInputTokens += b.cacheRead;
+        m.cacheMissTokens += b.input;
+        m.cacheWriteTokens += b.cacheWrite;
+        m.thinkingTokens += b.reasoning;
+        m.lastOutputTokens += outputTokens;
+        m.totalTokens += (inputTokens + outputTokens);
+        m.costUsd += costUsd;
+
+        total.turns += 1;
+        total.inputTokens += inputTokens;
+        total.outputTokens += outputTokens;
+        total.cachedInputTokens += b.cacheRead;
+        total.cacheMissTokens += b.input;
+        total.cacheWriteTokens += b.cacheWrite;
+        total.thinkingTokens += b.reasoning;
+        total.lastOutputTokens += outputTokens;
+        total.totalTokens += (inputTokens + outputTokens);
+        total.costUsd += costUsd;
+
+        turns.push({
+            time: new Date(call.atMs).toISOString(),
+            step: call.step == null ? turns.length : call.step,
+            model: modelName,
+            inputTokens,
+            outputTokens,
+            cachedInputTokens: b.cacheRead,
+            cacheMissTokens: b.input,
+            cacheWriteTokens: b.cacheWrite,
+            thinkingTokens: b.reasoning,
+            lastOutputTokens: outputTokens,
+            lastStepInputTokens: inputTokens,
+            lastStepOutputTokens: outputTokens,
+            lastStepCachedInputTokens: b.cacheRead,
+            agentMessageCount: 1,
+            totalTokens: inputTokens + outputTokens,
+            credit: 0,
+            costUsd,
+            provider: call.provider,
+            peak: !!tier.peak,
+            priced: !!tier.priced,
+            elapsedMs: 0,
+            ttftMs: 0,
+            requestId: entry.sessionId + '-call-' + turns.length
+        });
+    }
+
+    if (total.turns === 0) return null;
+
+    const stats = proj.stats || {};
+    const workspace = header.cwd || (proj.identity && proj.identity.cwd) || decodeDshProjectDir(entry.projectDir);
+    const name = proj.title || title || (workspace ? path.basename(workspace) : entry.sessionId);
+    const createdAtMs = Number(header.createdAt) || Number(proj.identity && proj.identity.createdAt) || 0;
+
+    return {
+        id: entry.sessionId,
+        name: String(name).replace(/\s+/g, ' ').trim().slice(0, 120) || entry.sessionId,
+        createdAt: createdAtMs ? new Date(createdAtMs).toISOString() : turns[0].time,
+        lastMessageAt: turns[turns.length - 1].time,
+        selectedModelId,
+        workspace,
+        source: DSH_SOURCE,
+        dir: entry.dir,
+        models: modelStats,
+        total,
+        turns,
+        dsh: {
+            origin: header.origin || '',
+            parentSession: header.parentSession || '',
+            delegationDepth: Number(header.delegationDepth) || 0,
+            agentPreset: header.agentPreset || '',
+            providers: [...providers],
+            peakCostUsd,
+            offPeakCostUsd,
+            llmMs: Number(stats.llmMs) || 0,
+            turnCount: Number(stats.turns) || 0
+        }
+    };
+}
+
+/** 增量缓存扫描 DSH 全部会话 */
+function collectDshTokenData() {
+    const home = resolveDshHome();
+    if (!home) return [];
+    if (!zstdSupported()) {
+        log.warn('当前运行时不支持 zstd 解码（需 Node 22.15+ / 23.8+），DSH 将回退到投影缓存总量');
+    }
+
+    const entries = listSessionLogFiles(path.join(home, 'sessions'));
+    if (entries.length === 0) return [];
+
+    let cache = {};
+    if (fs.existsSync(DSH_CACHE_FILE)) {
+        try { cache = JSON.parse(fs.readFileSync(DSH_CACHE_FILE, 'utf8')); } catch (e) {
+            log.warn('DSH 增量缓存读取失败，将全量重扫: ' + ((e && e.message) || e));
+        }
+    }
+
+    const conversations = [];
+    let cacheUpdated = false;
+
+    for (const entry of entries) {
+        try {
+            const stat = fs.statSync(entry.filePath);
+            const hit = cache[entry.sessionId];
+            if (hit && hit.v === DSH_CACHE_VERSION && hit.mtimeMs === stat.mtimeMs &&
+                hit.size === stat.size && hit.data) {
+                const { res, needsFix } = sanitizeCachedConversation(hit.data);
+                hit.data = res;
+                if (needsFix) cacheUpdated = true;
+                conversations.push(res);
+                continue;
+            }
+            const res = analyzeDshSession(home, entry);
+            cache[entry.sessionId] = {
+                v: DSH_CACHE_VERSION,
+                mtimeMs: stat.mtimeMs,
+                size: stat.size,
+                data: res
+            };
+            cacheUpdated = true;
+            if (res) conversations.push(res);
+        } catch (e) {}
+    }
+
+    if (cacheUpdated) {
+        try {
+            fs.writeFileSync(DSH_CACHE_FILE, JSON.stringify(cache));
+        } catch (e) {
+            log.warn('DSH 增量缓存写入失败: ' + ((e && e.message) || e));
+        }
+    }
+
+    return conversations;
+}
+
+// ==========================================
+// 4. 多源统一聚合管理器 (CodeBuddy & Antigravity & DSH)
 // ==========================================
 function collectTokenData(filterSource = 'all') {
     let codebuddyConvs = [];
     let antigravityConvs = [];
+    let dshConvs = [];
 
     if (filterSource === 'all' || filterSource === 'codebuddy') {
         try { codebuddyConvs = collectCodeBuddyTokenData(); } catch (e) {}
@@ -1993,9 +2244,13 @@ function collectTokenData(filterSource = 'all') {
         try { antigravityConvs = collectAntigravityTokenData(); } catch (e) {}
     }
 
-    const allConvs = [...antigravityConvs, ...codebuddyConvs];
+    if (filterSource === 'all' || filterSource === 'dsh') {
+        try { dshConvs = collectDshTokenData(); } catch (e) {}
+    }
+
+    const allConvs = [...dshConvs, ...antigravityConvs, ...codebuddyConvs];
     if (allConvs.length === 0) {
-        throw new Error('未检索到任何有效 Token 数据（请确认 CodeBuddy 或 Antigravity 目录下存在会话数据）');
+        throw new Error('未检索到任何有效 Token 数据（请确认 CodeBuddy / Antigravity / DSH 目录下存在会话数据）');
     }
 
     let globalModels = {};
@@ -2010,7 +2265,8 @@ function collectTokenData(filterSource = 'all') {
         lastOutputTokens: 0,
         totalTokens: 0,
         credit: 0,
-        elapsedMs: 0
+        elapsedMs: 0,
+        costUsd: 0
     };
 
     for (const res of allConvs) {
@@ -2028,7 +2284,8 @@ function collectTokenData(filterSource = 'all') {
                     lastOutputTokens: 0,
                     totalTokens: 0,
                     credit: 0,
-                    elapsedMs: 0
+                    elapsedMs: 0,
+                    costUsd: 0
                 };
             }
             const gm = globalModels[model];
@@ -2043,6 +2300,7 @@ function collectTokenData(filterSource = 'all') {
             gm.totalTokens += s.totalTokens;
             gm.credit += s.credit;
             gm.elapsedMs += s.elapsedMs;
+            gm.costUsd += (s.costUsd || 0);
 
             globalTotal.turns += s.turns;
             globalTotal.inputTokens += s.inputTokens;
@@ -2055,6 +2313,7 @@ function collectTokenData(filterSource = 'all') {
             globalTotal.totalTokens += s.totalTokens;
             globalTotal.credit += s.credit;
             globalTotal.elapsedMs += s.elapsedMs;
+            globalTotal.costUsd += (s.costUsd || 0);
         }
     }
 
@@ -2068,12 +2327,17 @@ function collectTokenData(filterSource = 'all') {
     const codebuddyCredits = getCodeBuddyCreditsInfo();
     const pointsTasksLast = getPointsTasksLastRun();
 
+    const dshPeakCostUsd = dshConvs.reduce((acc, c) => acc + ((c.dsh && c.dsh.peakCostUsd) || 0), 0);
+    const dshOffPeakCostUsd = dshConvs.reduce((acc, c) => acc + ((c.dsh && c.dsh.offPeakCostUsd) || 0), 0);
+    const dshPricing = getPricingConfig();
+
     return {
         fetchedAt: new Date().toISOString(),
         filterSource,
         antigravityQuota,
         codebuddyCredits,
         pointsTasksLast,
+        dshPricing,
         sourceStats: {
             antigravity: {
                 convCount: antigravityConvs.length,
@@ -2084,6 +2348,20 @@ function collectTokenData(filterSource = 'all') {
                 convCount: codebuddyConvs.length,
                 turnsCount: codebuddyConvs.reduce((acc, c) => acc + c.total.turns, 0),
                 totalTokens: codebuddyConvs.reduce((acc, c) => acc + c.total.totalTokens, 0)
+            },
+            dsh: {
+                convCount: dshConvs.length,
+                turnsCount: dshConvs.reduce((acc, c) => acc + c.total.turns, 0),
+                totalTokens: dshConvs.reduce((acc, c) => acc + c.total.totalTokens, 0),
+                inputTokens: dshConvs.reduce((acc, c) => acc + (c.total.inputTokens || 0), 0),
+                outputTokens: dshConvs.reduce((acc, c) => acc + (c.total.outputTokens || 0), 0),
+                cachedInputTokens: dshConvs.reduce((acc, c) => acc + (c.total.cachedInputTokens || 0), 0),
+                cacheMissTokens: dshConvs.reduce((acc, c) => acc + (c.total.cacheMissTokens || 0), 0),
+                cacheWriteTokens: dshConvs.reduce((acc, c) => acc + (c.total.cacheWriteTokens || 0), 0),
+                thinkingTokens: dshConvs.reduce((acc, c) => acc + (c.total.thinkingTokens || 0), 0),
+                costUsd: dshConvs.reduce((acc, c) => acc + (c.total.costUsd || 0), 0),
+                peakCostUsd: dshPeakCostUsd,
+                offPeakCostUsd: dshOffPeakCostUsd
             }
         },
         globalModels,
@@ -2176,6 +2454,7 @@ async function buildRefreshPayload({ writeReport = false } = {}) {
         creditsLive: creditsResult.live,
         creditsError: creditsResult.error,
         sourceStats: refreshed.sourceStats,
+        dshPricing: refreshed.dshPricing,
         buildId: SCRIPT_BUILD_ID,
         conversations: refreshed.conversations.map(c => ({
             id: c.id,
